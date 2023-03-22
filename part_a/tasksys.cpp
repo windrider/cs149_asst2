@@ -128,20 +128,59 @@ void TaskSystemParallelSpawn::sync() {
 const char* TaskSystemParallelThreadPoolSpinning::name() {
     return "Parallel + Thread Pool + Spin";
 }
+
+void TaskSystemParallelThreadPoolSpinning::bulkFetch(){
+    printf("bulkFetch\n");
+    while(!stop){
+        block.lock();
+        for(auto it = mBulkVec.begin(); it != mBulkVec.end(); it++){
+            TaskBulk* tb = *it;
+            if(tb->state==unpushed){
+                printf("unpushed,deps:%d\n",tb->deps.size());
+                bool mypush=true;
+                for(unsigned int j = 0; j < tb->deps.size(); ++j){
+                    TaskID bulkid=tb->deps[j];
+                    if( (unsigned int)bulkid >= mBulkVec.size() || mBulkVec[bulkid]->state != finished){
+                        mypush=false;
+                        break;
+                    }
+                }
+                if(mypush){
+                    tb -> state = pushed;
+                    printf("push\n");
+                    printf("now size: %d\n",mBulkVec.size());
+                    std::unique_lock<std::mutex> unique(mlock);
+                    for(unsigned int j = 0; j < tb -> taskVec.size(); j++){
+                        mworkqueue.push(tb -> taskVec[j]);       
+                    }
+                    unique.unlock();
+                    mcv.notify_all();
+                    
+                }
+            }
+        }
+        block.unlock();
+    }
+    printf("bulkFetch finish\n");
+}
+
 void TaskSystemParallelThreadPoolSpinning::myworker(){
     while(!stop){
         std::unique_lock<std::mutex> unique(mlock);
         //printf("wait before\n");
         mcv.wait(unique,[&](){return !mworkqueue.empty()||stop;});
         if(stop)break;
+        printf("get Task\n");
         MyTask* mtask=mworkqueue.front();
         mworkqueue.pop();
         mtask->runnable->runTask(mtask->i,mtask->num_total_tasks);
         if(mtask->tb==nullptr)__sync_bool_compare_and_swap(&myfinish,myfinish,myfinish+1);
         else{
             mtask->tb->tasks_to_finish--;
-            if(mtask->tb->tasks_to_finish==0)
+            printf("finish a task, now tasks_to_finish is %d\n",mtask->tb->tasks_to_finish);
+            if(mtask -> tb -> tasks_to_finish==0)
             {__sync_bool_compare_and_swap(&bulks_to_finish,bulks_to_finish,bulks_to_finish-1);
+                mtask -> tb -> state = finished;
                 printf("bulk finish\n");
             }
         }
@@ -161,15 +200,18 @@ TaskSystemParallelThreadPoolSpinning::TaskSystemParallelThreadPoolSpinning(int n
     //
     stop=false;
     myfinish=0;
-    numThreads=num_threads;
+    numThreads=num_threads+1;
     bulks_to_finish=0;
     for(int i=0;i<num_threads;i++){
         workThread[i]=std::thread(&TaskSystemParallelThreadPoolSpinning::myworker,this);
     }
+    workThread[num_threads] = std::thread(&TaskSystemParallelThreadPoolSpinning::bulkFetch, this);
+    printf("\n\n========\n");
+    printf("num_threads: %d\n", num_threads);
 }
 
 TaskSystemParallelThreadPoolSpinning::~TaskSystemParallelThreadPoolSpinning() {
-    //printf("dtor\n");
+    printf("dtor,numThreads:%d\n",numThreads);
     //std::unique_lock<std::mutex> unique(mlock);
     stop=true;
     //unique.unlock();
@@ -177,7 +219,7 @@ TaskSystemParallelThreadPoolSpinning::~TaskSystemParallelThreadPoolSpinning() {
     for(int i=0;i<numThreads;i++){
         workThread[i].join();
     }
-    //printf("pool stop\n");
+    printf("pool stop\n");
 }
 
 void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_total_tasks) {
@@ -214,29 +256,16 @@ void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_tota
 TaskID TaskSystemParallelThreadPoolSpinning::runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
                                                               const std::vector<TaskID>& deps) {
     __sync_bool_compare_and_swap(&(this->bulks_to_finish),bulks_to_finish,bulks_to_finish+1);
-    TaskBulk* tb=new TaskBulk(num_total_tasks);
+    TaskBulk* tb=new TaskBulk(num_total_tasks,deps);
+    for(int i=0;i<num_total_tasks;i++){
+        tb->taskVec.push_back(new MyTask(runnable,i,num_total_tasks,tb));       
+    }
+    block.lock();
     int taskID=mBulkVec.size();
     mBulkVec.push_back(tb);
-
-    /*
-    auto mydeps=deps;
-    while(!mydeps.empty()){
-        for(auto it=mydeps.begin();it!=mydeps.end();++it){
-            int bulkID=*it;
-            if(mBulkVec[bulkID]->tasks_to_finish==0){
-                mydeps.erase(it);
-            }
-        }
-    }
-    */
-
-    std::unique_lock<std::mutex> unique(mlock);
-    for(int i=0;i<num_total_tasks;i++){
-        mworkqueue.push(new MyTask(runnable,i,num_total_tasks,tb));       
-    }
-    unique.unlock();
+    block.unlock();
     mcv.notify_all();
-    printf("runAsync\n");
+    printf("runAsync tasknum: %d, taskid %d\n", num_total_tasks, taskID);
 
     return taskID;
 }
@@ -301,7 +330,9 @@ TaskID TaskSystemParallelThreadPoolSleeping::runAsyncWithDeps(IRunnable* runnabl
     //
     // TODO: CS149 students will implement this method in Part B.
     //
-
+    for (int i = 0; i < num_total_tasks; i++) {
+        runnable->runTask(i, num_total_tasks);
+    }
     return 0;
 }
 

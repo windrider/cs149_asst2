@@ -9,10 +9,16 @@
 #include <vector>
 
 const int max_thread_num=8;
+enum BulkState {unpushed,pushed,finished};
 
-struct TaskBulk{
+struct MyTask;
+
+struct TaskBulk{ 
     volatile int tasks_to_finish;
-    TaskBulk(int total_num):tasks_to_finish(total_num){}
+    std::vector<MyTask*> taskVec;
+    std::vector<TaskID> deps;
+    BulkState state;
+    TaskBulk(int total_num, const std::vector<TaskID>& d):tasks_to_finish(total_num),deps(d),state(unpushed){}
 };
 
 struct MyTask{
@@ -78,13 +84,15 @@ class TaskSystemParallelThreadPoolSpinning: public ITaskSystem {
                                 const std::vector<TaskID>& deps);
         void sync();
         void myworker();
+        void bulkFetch();
         std::thread workThread[max_thread_num];
 
         std::queue<MyTask*> mworkqueue;
         std::vector<TaskBulk*> mBulkVec;
         std::mutex mlock;
+        std::mutex block;
         std::condition_variable mcv;
-        bool stop;
+        volatile bool stop;
         volatile int myfinish;
         volatile int bulks_to_finish;
         int numThreads;

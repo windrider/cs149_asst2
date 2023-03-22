@@ -143,9 +143,9 @@ void TaskSystemParallelThreadPoolSpinning::run(IRunnable* runnable, int num_tota
 
 ```c++
 TaskSystemParallelThreadPoolSpinning::~TaskSystemParallelThreadPoolSpinning() {
-    stop=true;
+    stop = true;
     mcv.notify_all();
-    for(int i=0;i<numThreads;i++){
+    for(int i = 0 ; i < numThreads; i++){
         workThread[i].join();
     }
 }
@@ -158,4 +158,176 @@ TaskSystemParallelThreadPoolSpinning::~TaskSystemParallelThreadPoolSpinning() {
 ## Part B: Supporting Execution of Task Graphs
 
 ​	为线程池添加异步运行功能。
+
+<p align="center">
+    <img src="figs/task_graph.png" width=400>
+</p>
+
+```c++
+virtual TaskID runAsyncWithDeps(IRunnable* runnable, int num_total_tasks,
+                                const std::vector<TaskID>& deps) = 0;
+virtual void sync() = 0;
+```
+
+​	要求实现**runAsyncWithDeps**和**sync**两个接口。
+
+
+
+**runAsyncWithDeps**：
+
+​	一个 taskBulk (例如图中的**launchD**)可以包含多个task，但是这些 task 都依赖于其它的 taskBulk（记录在 **const std::vector<TaskID>& deps**中），要等依赖的 taskBulk 全都执行完，才能执行本taskBulk中的task。要求该接口调用后立刻返回，不必等 task 都执行完。该接口返回一个TaskID。
+
+
+
+**sync**:
+
+​	阻塞直到该线程池中所有task全部执行完后才返回。
+
+
+
+运行该异步线程池的示例代码：
+
+```C++
+// assume taskA and taskB are valid instances of IRunnable...
+
+std::vector<TaskID> noDeps;  // empty vector
+
+ITaskSystem *t = new TaskSystem(num_threads);
+
+// bulk launch of 4 tasks
+TaskID launchA = t->runAsyncWithDeps(taskA, 4, noDeps);
+
+// bulk launch of 8 tasks
+TaskID launchB = t->runAsyncWithDeps(taskB, 8, noDeps);
+
+// at this point tasks associated with launchA and launchB
+// may still be running
+
+t->sync();
+
+// at this point all 12 tasks associated with launchA and launchB
+// are guaranteed to have terminated
+```
+
+
+
+​	实现方案：
+
+用一个结构体TaskBulk存储某次launch的所有task
+
+```c++
+/*
+TaskBulk有三种状态：
+unpushed: 由于deps中的TaskBulk没有全部finish，还不能将taskVec中的task放入线程池的任务队列
+pushed: 已经将taskVec中的所有task放入线程池的任务队列
+finished: 本次launch的所有task全部完成
+*/
+enum BulkState {unpushed,pushed,finished};
+
+struct MyTask;
+
+struct TaskBulk{ 
+    volatile int tasks_to_finish; //本次launch未完成的task数量，为0时将state改为finished
+    std::vector<MyTask*> taskVec; //存储本次launch的所有task
+    std::vector<TaskID> deps;	//依赖的之前的TaskBulks
+    BulkState state;
+    TaskBulk(int total_num, const std::vector<TaskID>& d):tasks_to_finish(total_num),deps(d),state(unpushed){}
+};
+```
+
+
+
+**runAsyncWithDeps**的实现：
+
+```c++
+TaskID TaskSystemParallelThreadPoolSpinning::runAsyncWithDeps(IRunnable* runnable, int num_total_tasks, const std::vector<TaskID>& deps) {
+    
+    __sync_bool_compare_and_swap(&(this->bulks_to_finish),bulks_to_finish,bulks_to_finish+1);// 需要完成的taskBulk数量+1
+    /*
+    下面仅仅是实例化了一个TaskBulk结构体记录这个Taskbulk,将其放入线程池的mBulkVec中，之后就返回，留给之后的线程函数bulkFetch处理
+    */
+    TaskBulk* tb = new TaskBulk(num_total_tasks,deps);
+    for(int i = 0; i < num_total_tasks; i++){
+        tb->taskVec.push_back(new MyTask(runnable, i, num_total_tasks, tb));       
+    }
+    block.lock();
+    int taskID = mBulkVec.size();
+    mBulkVec.push_back(tb); //线程池中存储所有taskBulk的一个vector
+    block.unlock();
+    mcv.notify_all();
+
+    return taskID;
+}
+```
+
+
+
+线程池额外启动一个线程执行**bulkFetch**函数，作用不断轮询**mBulkVec**中有没有达到启动条件的taskBulk，若有的话将其中所有task放入线程池的任务队列**mworkqueue**中 (自我感觉这里加锁处理得比较粗糙)
+
+```C++
+void TaskSystemParallelThreadPoolSpinning::bulkFetch(){
+    while(!stop){
+        block.lock();
+        for(auto it = mBulkVec.begin(); it != mBulkVec.end(); it++){
+            TaskBulk* tb = *it;
+            if(tb->state==unpushed){
+                bool mypush=true;
+                for(unsigned int j = 0; j < tb->deps.size(); ++j){
+                    TaskID bulkid=tb->deps[j];
+                    if( (unsigned int)bulkid >= mBulkVec.size() || mBulkVec[bulkid]->state != finished){
+                        mypush=false;
+                        break;
+                    }
+                }
+                if(mypush){
+                    tb -> state = pushed;
+                    std::unique_lock<std::mutex> unique(mlock);
+                    for(unsigned int j = 0; j < tb -> taskVec.size(); j++){
+                        mworkqueue.push(tb -> taskVec[j]);       
+                    }
+                    unique.unlock();
+                    mcv.notify_all();
+                    
+                }
+            }
+        }
+        block.unlock();
+    }
+}
+```
+
+
+
+工作线程执行的线程函数，和partA的区别在于每个task都加了一个指向它所属的**taskBulk**的指针，当完成的task是对应**taskBulk**的最后一个task，将该**taskBulk**的state改为finished，并将**bulks_to_finish**（该线程池要完成的taskBulk数量）减1：
+
+```c++
+void TaskSystemParallelThreadPoolSpinning::myworker(){
+    while(!stop){
+        std::unique_lock<std::mutex> unique(mlock);
+        mcv.wait(unique,[&](){return !mworkqueue.empty() || stop;});
+        if(stop)break;
+        MyTask* mtask = mworkqueue.front();
+        mworkqueue.pop();
+        mtask->runnable->runTask(mtask->i,mtask->num_total_tasks);
+        mtask->tb->tasks_to_finish--;
+            if(mtask -> tb -> tasks_to_finish == 0){       __sync_bool_compare_and_swap(&bulks_to_finish, bulks_to_finish, bulks_to_finish-1);
+                mtask -> tb -> state = finished;
+            }
+        }
+    }
+}
+```
+
+
+
+**sync**函数，一旦调用就要一直忙等待到所有taskBulk全部执行完
+
+```c++
+void TaskSystemParallelThreadPoolSpinning::sync() {
+    while(bulks_to_finish!=0){
+        ;
+    }
+    return;
+}
+```
 
